@@ -1,0 +1,31 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Captured video streams, recordings, and raw dumps
+recordings/
+camera_dump/
+*.bin
+*.h264
+*.mjpg
+*.mp4
+*.webm
+*.pcap
+*.pcapng
+
+# Local machine network audit & raw unstripped photos
+probe_report.json
+telnet_audit.txt
+vs_play_debug.txt
+sample_frame.jpg
+2026*.jpg
+
+# OS / Editor / Environment
+.DS_Store
+Thumbs.db
+.env
+.vscode/
