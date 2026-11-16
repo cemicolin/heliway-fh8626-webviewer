@@ -218,9 +218,13 @@ class CameraEngine:
 
                 buf = bytearray()
                 last_keepalive = time.monotonic()
+                last_data_time = time.monotonic()
 
                 while self.running:
                     now = time.monotonic()
+                    if now - last_data_time > 3.0:
+                        self.last_error = "Stream stalled (>3s); reconnecting..."
+                        break
                     if now - last_keepalive > 1.2:
                         try:
                             sock.sendall(VISON_KEEPALIVE)
@@ -235,6 +239,8 @@ class CameraEngine:
                             break
                     except socket.timeout:
                         continue
+
+                    last_data_time = time.monotonic()
 
                     self.bytes_received += len(chunk)
                     bytes_since_last += len(chunk)
@@ -303,11 +309,16 @@ class CameraEngine:
 
             except Exception as e:
                 self.connected = False
+                self.throttle = 128
+                self.steering = 128
                 self.fps = 0.0
                 self.bitrate_kbps = 0.0
                 self.last_error = f"{type(e).__name__}: {e}"
                 time.sleep(1.2)
             finally:
+                self.connected = False
+                self.throttle = 128
+                self.steering = 128
                 try:
                     sock.close()
                 except Exception:
@@ -535,6 +546,11 @@ HTML_PAGE = """<!DOCTYPE html>
           <option value="vison_66">Vison (0x66..0x99)</option>
           <option value="heliway_ff">Heliway (0xFF 0x08)</option>
         </select>
+      </div>
+      <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px; font-size:0.8rem; color:var(--muted);">
+        <span style="white-space:nowrap;">Drive Power:</span>
+        <input id="rngPower" type="range" min="30" max="100" value="55" oninput="document.getElementById('valPower').textContent=this.value+'%';" onchange="updateDriveConfig()">
+        <span id="valPower" style="min-width:34px; text-align:right;">55%</span>
       </div>
       <div class="dpad">
         <div></div>
@@ -831,9 +847,16 @@ async function updateDriveConfig() {
   sendDriveUpdate();
 }
 
+function computeDriveValues() {
+  const pct = parseInt(document.getElementById('rngPower').value, 10) || 55;
+  const delta = Math.round((pct / 100) * 125);
+  const throttle = keys.w ? (128 + delta) : (keys.s ? (128 - delta) : 128);
+  const steering = keys.d ? (128 + delta) : (keys.a ? (128 - delta) : 128);
+  return { throttle, steering };
+}
+
 async function sendDriveUpdate() {
-  const throttle = keys.w ? 220 : (keys.s ? 35 : 128);
-  const steering = keys.d ? 220 : (keys.a ? 35 : 128);
+  const { throttle, steering } = computeDriveValues();
   document.getElementById('driveTelemetry').textContent = `Throttle: ${throttle} | Steering: ${steering}`;
   if (controlInFlight) {
     controlDirty = true;
@@ -843,14 +866,13 @@ async function sendDriveUpdate() {
   try {
     do {
       controlDirty = false;
-      const t = keys.w ? 220 : (keys.s ? 35 : 128);
-      const s = keys.d ? 220 : (keys.a ? 35 : 128);
+      const vals = computeDriveValues();
       await fetch('/api/control', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
-          throttle: t,
-          steering: s,
+          throttle: vals.throttle,
+          steering: vals.steering,
           control_enabled: document.getElementById('chkDrive').checked,
           control_variant: document.getElementById('selVariant').value
         })
