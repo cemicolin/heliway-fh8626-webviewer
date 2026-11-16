@@ -186,7 +186,7 @@ class CameraEngine:
                     sock.sendto(pkt, (self.camera_ip, self.control_port))
                 except Exception:
                     pass
-            time.sleep(0.025)  # 40 Hz control rate
+            time.sleep(0.05)  # 20 Hz control rate (low Wi-Fi contention)
 
     def _video_loop(self) -> None:
         last_rate_time = time.monotonic()
@@ -538,13 +538,13 @@ HTML_PAGE = """<!DOCTYPE html>
       </div>
       <div class="dpad">
         <div></div>
-        <button id="btnW" onmousedown="setKey('w',true)" onmouseup="setKey('w',false)">W ▲</button>
+        <button id="btnW" onmousedown="setKey('w',true)" onmouseup="setKey('w',false)" onmouseleave="setKey('w',false)">W ▲</button>
         <div></div>
-        <button id="btnA" onmousedown="setKey('a',true)" onmouseup="setKey('a',false)">◄ A</button>
+        <button id="btnA" onmousedown="setKey('a',true)" onmouseup="setKey('a',false)" onmouseleave="setKey('a',false)">◄ A</button>
         <button onclick="stopDrive()">STOP</button>
-        <button id="btnD" onmousedown="setKey('d',true)" onmouseup="setKey('d',false)">D ►</button>
+        <button id="btnD" onmousedown="setKey('d',true)" onmouseup="setKey('d',false)" onmouseleave="setKey('d',false)">D ►</button>
         <div></div>
-        <button id="btnS" onmousedown="setKey('s',true)" onmouseup="setKey('s',false)">S ▼</button>
+        <button id="btnS" onmousedown="setKey('s',true)" onmouseup="setKey('s',false)" onmouseleave="setKey('s',false)">S ▼</button>
         <div></div>
       </div>
       <div style="font-size:0.78rem; color:var(--muted); text-align:center;" id="driveTelemetry">
@@ -649,13 +649,21 @@ function handleH264Frame(isKey, bytes) {
 // Low-latency raw binary stream reader (/api/video: [1B isKey][4B LE len][H.264 bytes])
 async function startBinaryStream() {
   while (true) {
+    const ac = new AbortController();
+    let stallTimer = null;
+    const resetStall = () => {
+      if (stallTimer) clearTimeout(stallTimer);
+      stallTimer = setTimeout(() => ac.abort(), 4500);
+    };
     try {
-      const res = await fetch('/api/video', { cache: 'no-store' });
+      resetStall();
+      const res = await fetch('/api/video', { cache: 'no-store', signal: ac.signal });
       const reader = res.body.getReader();
       let buf = new Uint8Array(0);
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        resetStall();
         const merged = new Uint8Array(buf.length + value.length);
         merged.set(buf, 0);
         merged.set(value, buf.length);
@@ -663,7 +671,7 @@ async function startBinaryStream() {
         let offset = 0;
         while (buf.length - offset >= 5) {
           const isKey = buf[offset] === 1;
-          const len = buf[offset + 1] | (buf[offset + 2] << 8) | (buf[offset + 3] << 16) | (buf[offset + 4] << 24);
+          const len = (buf[offset + 1] | (buf[offset + 2] << 8) | (buf[offset + 3] << 16) | (buf[offset + 4] << 24)) >>> 0;
           if (len <= 0 || len > 512 * 1024) { offset = buf.length; break; }
           if (buf.length - offset < 5 + len) break;
           const frameBytes = buf.slice(offset + 5, offset + 5 + len);
@@ -674,16 +682,20 @@ async function startBinaryStream() {
       }
     } catch (e) {
       console.warn('Stream reconnecting...', e);
+    } finally {
+      if (stallTimer) clearTimeout(stallTimer);
     }
     await new Promise(r => setTimeout(r, 800));
   }
 }
 startBinaryStream();
 
-// Poll status every 1s
-setInterval(async () => {
+// Non-overlapping status poller
+async function pollStatus() {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 1500);
   try {
-    const res = await fetch('/api/status');
+    const res = await fetch('/api/status', { signal: ac.signal, cache: 'no-store' });
     const st = await res.json();
     const badge = document.getElementById('connBadge');
     if (st.connected) {
@@ -704,8 +716,13 @@ setInterval(async () => {
     if (st.last_hex_sample) {
       document.getElementById('valHex').textContent = st.last_hex_sample;
     }
-  } catch (_) {}
-}, 1000);
+  } catch (_) {
+  } finally {
+    clearTimeout(timer);
+    setTimeout(pollStatus, 1000);
+  }
+}
+pollStatus();
 
 function takeSnapshot() {
   const a = document.createElement('a');
@@ -777,7 +794,11 @@ function flipCamera() {
 
 // WASD / Arrow Driving Controls
 const keys = { w: false, a: false, s: false, d: false };
+let controlInFlight = false;
+let controlDirty = false;
+
 function setKey(k, state) {
+  if (keys[k] === state) return; // Ignore OS key-repeat floods
   keys[k] = state;
   const btn = document.getElementById('btn' + k.toUpperCase());
   if (btn) btn.className = state ? 'active' : '';
@@ -788,8 +809,9 @@ function stopDrive() {
   ['W','A','S','D'].forEach(k => document.getElementById('btn'+k).className = '');
   sendDriveUpdate();
 }
+window.addEventListener('blur', stopDrive);
 window.addEventListener('keydown', (e) => {
-  if (e.target.tagName === 'INPUT') return;
+  if (e.target.tagName === 'INPUT' || e.repeat) return;
   const k = e.key.toLowerCase();
   if (k === 'w' || e.key === 'ArrowUp') setKey('w', true);
   if (k === 's' || e.key === 'ArrowDown') setKey('s', true);
@@ -813,16 +835,31 @@ async function sendDriveUpdate() {
   const throttle = keys.w ? 220 : (keys.s ? 35 : 128);
   const steering = keys.d ? 220 : (keys.a ? 35 : 128);
   document.getElementById('driveTelemetry').textContent = `Throttle: ${throttle} | Steering: ${steering}`;
-  await fetch('/api/control', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      throttle,
-      steering,
-      control_enabled: document.getElementById('chkDrive').checked,
-      control_variant: document.getElementById('selVariant').value
-    })
-  });
+  if (controlInFlight) {
+    controlDirty = true;
+    return;
+  }
+  controlInFlight = true;
+  try {
+    do {
+      controlDirty = false;
+      const t = keys.w ? 220 : (keys.s ? 35 : 128);
+      const s = keys.d ? 220 : (keys.a ? 35 : 128);
+      await fetch('/api/control', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          throttle: t,
+          steering: s,
+          control_enabled: document.getElementById('chkDrive').checked,
+          control_variant: document.getElementById('selVariant').value
+        })
+      });
+    } while (controlDirty);
+  } catch (_) {
+  } finally {
+    controlInFlight = false;
+  }
 }
 </script>
 </body>
