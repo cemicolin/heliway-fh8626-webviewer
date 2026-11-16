@@ -47,14 +47,25 @@ python rcamera_app.py [--ip 172.16.10.1] [--host 127.0.0.1] [--port 8000] [--ssl
 - **`--cert` / `--key`**: Use your own TLS certificate and key PEM files instead of auto-generating.
 - **`--port`**: Change local web UI port (default `8000`).
 
-### Headless Raspberry Pi Bridge (Ethernet + USB Wi-Fi)
-If you want to keep your PC on your home network while viewing the camera:
-1. Connect the Pi's **Ethernet** to your home router and its **USB Wi-Fi** to the camera's hotspot (`172.16.10.1`).
-2. Start the server over HTTPS:
+### Headless Raspberry Pi Bridge (Ethernet + Wi-Fi, or Dual Wi-Fi)
+If you want to keep your PC on your home network while viewing the camera (or place a wireless Pi bridge in the room where you drive):
+1. **Interface setup:**
+   - **Ethernet + Wi-Fi (e.g., Pi B+):** Connect Ethernet to your home router and USB Wi-Fi to the camera's hotspot (`172.16.10.1`).
+   - **Dual Wi-Fi (e.g., Pi 3B + USB Wi-Fi dongle):** Assign one radio (`wlan0` or `wlan1`) to your home Wi-Fi (ideally **5 GHz** on a dual-band dongle to avoid 2.4 GHz interference) and the other to the camera (`172.16.10.1`).
+2. **Keep the default route on your home network** (the camera's DHCP advertises `172.16.10.1` as a gateway; on Raspberry Pi OS Bookworm / NetworkManager, pin the camera interface and disable its default route):
    ```bash
+   nmcli connection modify "<Camera-SSID>" connection.interface-name wlan1 ipv4.never-default yes
+   nmcli connection modify "<Home-SSID>" connection.interface-name wlan0
+   ```
+   *(Swap `wlan0`/`wlan1` as needed. On older `dhcpcd`-based Pi OS, add `interface wlan1` + `nogateway` in `/etc/dhcpcd.conf`.)*
+3. **Install prerequisites (on Raspberry Pi OS Lite, `git` is not preinstalled) & start the server over HTTPS:**
+   ```bash
+   sudo apt update && sudo apt install -y git openssl
    python3 rcamera_app.py --host 0.0.0.0 --ssl --no-browser
    ```
-3. Open `https://<pi-lan-ip>:8000` in Chrome/Edge (accept the self-signed certificate warning once), **or** run without `--ssl` and tunnel over SSH (`ssh -L 8000:127.0.0.1:8000 pi@<pi-lan-ip>`) to `http://127.0.0.1:8000`.
+4. Open `https://<pi-lan-ip>:8000` in Chrome/Edge (accept the self-signed certificate warning once), **or** run without `--ssl` and tunnel over SSH (`ssh -L 8000:127.0.0.1:8000 pi@<pi-lan-ip>`) to `http://127.0.0.1:8000`.
+
+> **SD Card Wear Note:** No endurance SD card is needed. Live streaming runs entirely in RAM with zero continuous disk writes, and **Save Snapshot (PNG)** / **Record Video (`.webm`)** save directly in your client browser. Only the optional **Record Raw Stream** button writes `.h264` files to `recordings/` on the Pi.
 
 ---
 

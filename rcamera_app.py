@@ -14,7 +14,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import base64
 import datetime
 import http.server
 import json
@@ -96,8 +95,8 @@ class CameraEngine:
         self.control_enabled = False
         self.control_variant = "vison_66"  # "vison_66" or "heliway_ff"
 
-        # Subscribers for SSE stream
-        self.subscribers: list[queue.Queue[dict[str, Any]]] = []
+        # Subscribers for binary video stream
+        self.subscribers: list[queue.Queue[tuple[bool, bytes]]] = []
 
         self._worker_thread: threading.Thread | None = None
         self._control_thread: threading.Thread | None = None
@@ -111,29 +110,41 @@ class CameraEngine:
         self._control_thread = threading.Thread(target=self._control_loop, daemon=True)
         self._control_thread.start()
 
-    def subscribe(self) -> queue.Queue[dict[str, Any]]:
-        q: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=30)
+    def subscribe(self) -> queue.Queue[tuple[bool, bytes]]:
+        q: queue.Queue[tuple[bool, bytes]] = queue.Queue(maxsize=12)
         with self.lock:
             self.subscribers.append(q)
         return q
 
-    def unsubscribe(self, q: queue.Queue[dict[str, Any]]) -> None:
+    def unsubscribe(self, q: queue.Queue[tuple[bool, bytes]]) -> None:
         with self.lock:
             if q in self.subscribers:
                 self.subscribers.remove(q)
 
-    def broadcast(self, event: dict[str, Any]) -> None:
+    def broadcast(self, is_key: bool, packet: bytes) -> None:
         with self.lock:
             dead = []
             for q in self.subscribers:
+                # Flush stale queued frames on keyframe or overflow so latency never builds up
+                if is_key and not q.empty():
+                    while not q.empty():
+                        try:
+                            q.get_nowait()
+                        except queue.Empty:
+                            break
                 try:
-                    q.put_nowait(event)
+                    q.put_nowait((is_key, packet))
                 except queue.Full:
-                    try:
-                        q.get_nowait()
-                        q.put_nowait(event)
-                    except Exception:
-                        dead.append(q)
+                    while not q.empty():
+                        try:
+                            q.get_nowait()
+                        except queue.Empty:
+                            break
+                    if is_key:
+                        try:
+                            q.put_nowait((is_key, packet))
+                        except Exception:
+                            dead.append(q)
             for q in dead:
                 self.subscribers.remove(q)
 
@@ -190,6 +201,7 @@ class CameraEngine:
             sock.settimeout(2.0)
             try:
                 sock.connect((self.camera_ip, self.video_port))
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.connected = True
                 self.last_error = ""
                 # Send UDP 8080 wake-up first, then TCP 8888 "((" (0x28 0x28) stream-start
@@ -274,12 +286,8 @@ class CameraEngine:
                         self.codec_detected = "H.264 720p (1280x720 Main@L3.1)"
                         self.frames_emitted += 1
                         frames_since_last += 1
-                        self.broadcast({
-                            "type": "h264_frame",
-                            "is_key": is_key,
-                            "data": base64.b64encode(clean_frame).decode("ascii"),
-                            "ts": time.time(),
-                        })
+                        wire_packet = struct.pack("<BI", 1 if is_key else 0, len(clean_frame)) + clean_frame
+                        self.broadcast(is_key, wire_packet)
 
                     # Prevent unbounded buffer growth
                     if len(buf) > 512 * 1024:
@@ -605,20 +613,17 @@ function initH264Decoder() {
 }
 initH264Decoder();
 
-function b64ToUint8Array(b64) {
-  const bin = atob(b64);
-  const arr = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-  return arr;
-}
-
-function handleH264Frame(isKey, b64Data) {
+function handleH264Frame(isKey, bytes) {
   if (!('VideoDecoder' in window)) return;
   if (!h264Decoder || h264Decoder.state === 'closed') {
     decoderConfigured = false;
     initH264Decoder();
   }
-  const bytes = b64ToUint8Array(b64Data);
+  // If browser fell behind (e.g. background tab), reset to snap back to real time on next keyframe
+  if (h264Decoder.decodeQueueSize > 4 && isKey) {
+    try { h264Decoder.reset(); } catch (_) {}
+    decoderConfigured = false;
+  }
   if (!decoderConfigured) {
     if (!isKey) return; // Wait for 00 00 01 a1 keyframe (contains SPS + PPS + IDR)
     try {
@@ -641,14 +646,39 @@ function handleH264Frame(isKey, b64Data) {
   }
 }
 
-// Subscribe to live stream events
-const evtSource = new EventSource('/api/stream');
-evtSource.onmessage = (e) => {
-  const msg = JSON.parse(e.data);
-  if (msg.type === 'h264_frame') {
-    handleH264Frame(msg.is_key, msg.data);
+// Low-latency raw binary stream reader (/api/video: [1B isKey][4B LE len][H.264 bytes])
+async function startBinaryStream() {
+  while (true) {
+    try {
+      const res = await fetch('/api/video', { cache: 'no-store' });
+      const reader = res.body.getReader();
+      let buf = new Uint8Array(0);
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const merged = new Uint8Array(buf.length + value.length);
+        merged.set(buf, 0);
+        merged.set(value, buf.length);
+        buf = merged;
+        let offset = 0;
+        while (buf.length - offset >= 5) {
+          const isKey = buf[offset] === 1;
+          const len = buf[offset + 1] | (buf[offset + 2] << 8) | (buf[offset + 3] << 16) | (buf[offset + 4] << 24);
+          if (len <= 0 || len > 512 * 1024) { offset = buf.length; break; }
+          if (buf.length - offset < 5 + len) break;
+          const frameBytes = buf.slice(offset + 5, offset + 5 + len);
+          offset += 5 + len;
+          handleH264Frame(isKey, frameBytes);
+        }
+        buf = offset > 0 ? buf.slice(offset) : buf;
+      }
+    } catch (e) {
+      console.warn('Stream reconnecting...', e);
+    }
+    await new Promise(r => setTimeout(r, 800));
   }
-};
+}
+startBinaryStream();
 
 // Poll status every 1s
 setInterval(async () => {
@@ -833,23 +863,25 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
-        elif self.path == "/api/stream":
+        elif self.path == "/api/video":
+            try:
+                self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
             self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
             self.end_headers()
             q = ENGINE.subscribe()
             try:
                 while True:
                     try:
-                        evt = q.get(timeout=5.0)
-                        payload = f"data: {json.dumps(evt)}\n\n".encode("utf-8")
-                        self.wfile.write(payload)
+                        _, packet = q.get(timeout=5.0)
+                        self.wfile.write(packet)
                         self.wfile.flush()
                     except queue.Empty:
-                        self.wfile.write(b": keepalive\n\n")
-                        self.wfile.flush()
+                        continue
             except Exception:
                 pass
             finally:
@@ -896,6 +928,21 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
 
 class ThreadedHTTPServer(http.server.ThreadingHTTPServer):
     allow_reuse_address = True
+    daemon_threads = True
+    ssl_context: ssl.SSLContext | None = None
+
+    def get_request(self) -> tuple[Any, Any]:
+        sock, addr = super().get_request()
+        if self.ssl_context is not None:
+            sock = self.ssl_context.wrap_socket(sock, server_side=True, do_handshake_on_connect=False)
+        return sock, addr
+
+    def finish_request(self, request: Any, client_address: Any) -> None:
+        if isinstance(request, ssl.SSLSocket):
+            request.settimeout(5.0)
+            request.do_handshake()
+            request.settimeout(None)
+        super().finish_request(request, client_address)
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         _, exc, _ = sys.exc_info()
@@ -969,7 +1016,7 @@ def main() -> None:
         ensure_self_signed_cert(cert_path, key_path)
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
-        server.socket = ctx.wrap_socket(server.socket, server_side=True)
+        server.ssl_context = ctx
 
     ENGINE.start()
     scheme = "https" if use_ssl else "http"
