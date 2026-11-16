@@ -17,7 +17,9 @@ camera_dump/
 *.pcap
 *.pcapng
 
-# Local machine network audit & raw unstripped photos
+# Local machine network audit, TLS certs & raw unstripped photos
+certs/
+*.pem
 probe_report.json
 telnet_audit.txt
 vs_play_debug.txt

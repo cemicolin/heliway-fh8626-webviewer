@@ -22,7 +22,9 @@ import os
 import platform
 import queue
 import re
+import shutil
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -565,7 +567,22 @@ let timestampCounter = 0;
 let flip180 = true; // Camera reports mirror=1 on UDP 0x1A
 
 function initH264Decoder() {
-  if (!('VideoDecoder' in window)) return;
+  if (!('VideoDecoder' in window)) {
+    ctx.fillStyle = '#090d16';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#f85149';
+    ctx.font = 'bold 20px sans-serif';
+    ctx.textAlign = 'center';
+    if (!window.isSecureContext) {
+      ctx.fillText('WebCodecs H.264 requires HTTPS or localhost.', canvas.width / 2, canvas.height / 2 - 16);
+      ctx.fillStyle = '#8b949e';
+      ctx.font = '16px sans-serif';
+      ctx.fillText('Restart server with --ssl (https://<host>:8000) or SSH tunnel to http://127.0.0.1:8000', canvas.width / 2, canvas.height / 2 + 18);
+    } else {
+      ctx.fillText('WebCodecs VideoDecoder is not supported in this browser (use Chrome, Edge, or Safari 16.4+).', canvas.width / 2, canvas.height / 2);
+    }
+    return;
+  }
   h264Decoder = new VideoDecoder({
     output: (frame) => {
       if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
@@ -882,9 +899,49 @@ class ThreadedHTTPServer(http.server.ThreadingHTTPServer):
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         _, exc, _ = sys.exc_info()
-        if isinstance(exc, (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)):
+        if isinstance(exc, (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, ssl.SSLError)):
             return
         super().handle_error(request, client_address)
+
+
+def ensure_self_signed_cert(cert_path: str, key_path: str) -> None:
+    """Generate a local self-signed TLS certificate using OpenSSL if one does not exist."""
+    if os.path.exists(cert_path) and os.path.exists(key_path):
+        return
+    openssl_bin = shutil.which("openssl")
+    if not openssl_bin and platform.system() == "Windows":
+        for candidate in (
+            r"C:\Program Files\Git\usr\bin\openssl.exe",
+            r"C:\Program Files (x86)\Git\usr\bin\openssl.exe",
+        ):
+            if os.path.exists(candidate):
+                openssl_bin = candidate
+                break
+    if not openssl_bin:
+        raise RuntimeError(
+            "OpenSSL CLI not found. Install OpenSSL or pass existing --cert and --key files."
+        )
+    os.makedirs(os.path.dirname(cert_path), exist_ok=True)
+    subprocess.check_call(
+        [
+            openssl_bin,
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            key_path,
+            "-out",
+            cert_path,
+            "-days",
+            "3650",
+            "-nodes",
+            "-subj",
+            "/CN=heliway-fh8626-webviewer",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def main() -> None:
@@ -892,6 +949,9 @@ def main() -> None:
     parser.add_argument("--ip", help="Camera IP override (disables auto-detection; default auto -> 172.16.10.1)")
     parser.add_argument("--host", default="127.0.0.1", help="Web UI bind host (use 0.0.0.0 for LAN/Pi access)")
     parser.add_argument("--port", type=int, default=8000, help="Local web UI port (default: 8000)")
+    parser.add_argument("--ssl", action="store_true", help="Enable HTTPS with auto-generated self-signed cert (needed for WebCodecs over LAN)")
+    parser.add_argument("--cert", help="Path to TLS certificate PEM file (implies --ssl)")
+    parser.add_argument("--key", help="Path to TLS private key PEM file (implies --ssl)")
     parser.add_argument("--no-browser", action="store_true", help="Do not auto-open browser")
     args = parser.parse_args()
 
@@ -899,13 +959,28 @@ def main() -> None:
         ENGINE.camera_ip = args.ip
         ENGINE.auto_detect = False
 
-    ENGINE.start()
+    use_ssl = args.ssl or bool(args.cert and args.key)
     server = ThreadedHTTPServer((args.host, args.port), RequestHandler)
+
+    if use_ssl:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        cert_path = args.cert or os.path.join(base_dir, "certs", "cert.pem")
+        key_path = args.key or os.path.join(base_dir, "certs", "key.pem")
+        ensure_self_signed_cert(cert_path, key_path)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+        server.socket = ctx.wrap_socket(server.socket, server_side=True)
+
+    ENGINE.start()
+    scheme = "https" if use_ssl else "http"
     display_host = "127.0.0.1" if args.host == "0.0.0.0" else args.host
-    url = f"http://{display_host}:{args.port}"
+    url = f"{scheme}://{display_host}:{args.port}"
     print("======================================================================")
     print(f" Odyssey / Heliway Wi-Fi FPV Station running at: {url}")
     print(" Hardware: Fullhan FH8626V100 + Vison VS-H62 + Marvell 88W8801")
+    if args.host not in ("127.0.0.1", "localhost") and not use_ssl:
+        print(" [NOTE] Remote LAN browsers require HTTPS (--ssl) or an SSH tunnel")
+        print(f"        (ssh -L {args.port}:127.0.0.1:{args.port} user@host) for WebCodecs H.264.")
     print("======================================================================")
     if not args.no_browser:
         webbrowser.open(url)
